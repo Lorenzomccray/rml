@@ -1,0 +1,114 @@
+name: E2E Tests
+
+on:
+  pull_request:
+    branches: [ "**" ]
+  workflow_dispatch:
+
+jobs:
+  build-rml-binary:
+    name: Build RML Binary
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.7.20" # Ensure this matches the version in the Makefile
+          enable-cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: 'pyproject.toml'
+
+      - name: Install and build
+        run: |
+          make install
+          source .venv/bin/activate
+          make bundle
+
+      - name: Upload built artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rml-linux-tarball
+          path: dist/rml-linux-*.tar.gz
+
+      - name: Upload e2e test file
+        uses: actions/upload-artifact@v4
+        with:
+          name: test_e2e.py
+          path: tests/e2e/test_e2e.py
+
+  e2e-test:
+    name: Run E2E Tests
+    needs: build-rml-binary
+    runs-on: ubuntu-latest
+    # Ensures only external contributors require approval to run the E2E tests
+    environment: ${{ github.event.pull_request.head.repo.full_name != github.repository && 'E2E' || '' }}
+
+    permissions:
+      contents: read
+      id-token: write  # Required for OIDC/Workload Identity Federation
+    env:
+      WORKSPACE_ROOT: ${{ github.workspace }}
+    steps:
+      - name: Download RML binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rml-linux-tarball
+          path: artifact
+
+      - name: Download e2e test file
+        uses: actions/download-artifact@v4
+        with:
+          name: test_e2e.py
+          path: artifact
+
+      - name: Extract binary
+        run: |
+          mkdir -p dist/extracted
+          TAR_FILE=$(ls artifact/rml-linux-*.tar.gz | head -n1)
+          echo "Using tarball: $TAR_FILE"
+          tar -xzf "$TAR_FILE" -C dist/extracted
+          echo "RECURSE_API_KEY=${{ secrets.E2E_TEST_RML_KEY }}" > dist/extracted/rml/.env.rml
+          echo "BIN_DIR=$PWD/dist/extracted/rml" >> $GITHUB_ENV
+
+      - name: Add binary to PATH
+        run: echo "$BIN_DIR" >> $GITHUB_PATH
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pytest
+        run: pip install pytest
+
+      - name: Smoke test binary in clean shell
+        shell: bash -l {0}
+        run: |
+          set -euxo pipefail
+          rml --version
+          rml -md --help
+
+      - name: Clone rml-e2e-test
+        uses: actions/checkout@v5
+        with:
+          repository: Recurse-ML/rml-e2e-test
+          ref: e2e-test-branch
+          path: rml-e2e-test
+          fetch-depth: 0
+
+      - name: Fetch main branch
+        working-directory: ${{ env.WORKSPACE_ROOT }}/rml-e2e-test
+        run: git fetch origin main
+
+      - name: Run e2e test file
+        working-directory: ${{ env.WORKSPACE_ROOT }}
+        env:
+          TEST_REPO: ${{ env.WORKSPACE_ROOT }}/rml-e2e-test
+          BUG_BRANCH: "e2e-test-branch"
+        run: pytest -s -vv artifact/test_e2e.py
